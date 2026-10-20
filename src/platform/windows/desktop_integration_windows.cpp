@@ -51,6 +51,29 @@ namespace lumin
 
 	static bool g_isPre24H2 = false;
 
+	// Desktop locking detection
+	struct DesktopCloser
+	{
+		void operator()(HDESK h) const noexcept
+		{
+			if (h) {
+				CloseDesktop(h);
+			}
+		}
+	};
+	using unique_desktop = std::unique_ptr<std::remove_pointer_t<HDESK>, DesktopCloser>;
+
+	struct HandleCloser
+	{
+		void operator()(HANDLE h) const noexcept
+		{
+			if (h) {
+				CloseHandle(h);
+			}
+		}
+	};
+	using unique_handle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
+
 	// Monitor enumeration callback
 	BOOL CALLBACK MonitorEnumProc(
 		HMONITOR monitorHandle, [[maybe_unused]] HDC monitorDeviceContext, [[maybe_unused]] LPRECT monitorRectangle,
@@ -281,7 +304,7 @@ namespace lumin
 		int CloakedVal;
 		HRESULT hRes = DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, &CloakedVal, sizeof(CloakedVal));
 		if (hRes != S_OK) {
-			CloakedVal = 0;
+			CloakedVal = true;
 		}
 		return CloakedVal ? true : false;
 	}
@@ -313,45 +336,104 @@ namespace lumin
 		return static_cast<double>(occludedCount) / static_cast<double>(totalSamples);
 	}
 
+	static bool IsWindowOpaque(HWND hWnd)
+	{
+	    LONG_PTR exStyle = GetWindowLongPtr(hWnd, GWL_EXSTYLE);
+
+	    if (exStyle & WS_EX_TRANSPARENT)
+	        return false;
+
+	    if (exStyle & WS_EX_LAYERED) {
+	        BYTE alpha = 255;
+	        if (GetLayeredWindowAttributes(hWnd, nullptr, &alpha, nullptr) && alpha == 0)
+	            return false;
+	    }
+
+	    return true;
+	}
+
+	static bool IsShellOverlay(HWND hWnd)
+	{
+	    char cls[256];
+	    if (!GetClassNameA(hWnd, cls, 256))
+	        return false;
+
+	    // Classes that only the shell uses.  Anything under these names
+	    // is not a user application window, so it's safe to skip.
+	    if (strcmp(cls, "ShellHandwritingCanvas") == 0)
+	        return true;
+	    if (strcmp(cls, "XamlExplorerHostIslandWindow") == 0)
+	        return true;
+
+	    // `Windows.UI.Core.CoreWindow` is used by both shell overlays and
+	    // real UWP apps (e.g. a fullscreen UWP video player, which SHOULD
+	    // count as occlusion).  Distinguish by owning process.
+	    if (strcmp(cls, "Windows.UI.Core.CoreWindow") == 0) {
+	        DWORD pid = 0;
+	        GetWindowThreadProcessId(hWnd, &pid);
+	        if (pid == 0)
+	            return false;
+
+	        unique_handle proc {OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)};
+	        if (!proc)
+	            return false;
+
+	        WCHAR path[MAX_PATH];
+	        DWORD len = std::size(path);
+	        if (!QueryFullProcessImageNameW(proc.get(), 0, path, &len))
+	            return false;
+
+	        static const WCHAR *kShellProcs[] = {
+	            L"TextInputHost.exe",
+	            L"ShellExperienceHost.exe",
+	            L"StartMenuExperienceHost.exe",
+	            L"SearchHost.exe",
+	        };
+	        const WCHAR *exe = PathFindFileNameW(path);
+	        for (auto *p : kShellProcs) {
+	            if (_wcsicmp(exe, p) == 0)
+	                return true;
+	        }
+	        return false;
+	    }
+
+	    return false;
+	}
+
 	BOOL CALLBACK FullscreenWindowEnumProc(HWND hwnd, LPARAM lParam)
 	{
-		FullscreenOcclusionData *occlusionData = reinterpret_cast<FullscreenOcclusionData *>(lParam);
+	    FullscreenOcclusionData *occlusionData = reinterpret_cast<FullscreenOcclusionData *>(lParam);
 
-		if (hwnd == g_engineWindowHandle || hwnd == g_workerWindowHandle) {
-			return TRUE;
-		}
+	    if (hwnd == g_engineWindowHandle || hwnd == g_workerWindowHandle)
+	        return TRUE;
 
-		// Skip non-visible or minimized windows.
-		if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
-			return TRUE;
-		}
+	    if (!IsWindowVisible(hwnd) || IsIconic(hwnd))
+	        return TRUE;
 
-		// make sure it isnt the shell window
-		if (GetShellWindow() == hwnd) {
-			return TRUE;
-		}
+	    if (GetShellWindow() == hwnd)
+	        return TRUE;
 
-		// make sure it isnt a workerw window
-		char g_szClassName[256];
-		GetClassNameA(hwnd, g_szClassName, 256);
+	    char g_szClassName[256];
+	    GetClassNameA(hwnd, g_szClassName, 256);
 
-		if (strcmp(g_szClassName, "WorkerW") == 0) {
-			return TRUE;
-		}
+	    if (strcmp(g_szClassName, "WorkerW") == 0)
+	        return TRUE;
 
-		// check that it isnt the Nvidia overlay
-		if (strcmp(g_szClassName, "CEF-OSC-WIDGET") == 0) {
-			return TRUE;
-		}
+	    if (strcmp(g_szClassName, "CEF-OSC-WIDGET") == 0)
+	        return TRUE;
 
-		// Skip the invisible windows that are part of the Windows 10 background app
-		if (IsInvisibleWin10BackgroundAppWindow(hwnd)) {
-			return TRUE;
-		}
+	    if (IsInvisibleWin10BackgroundAppWindow(hwnd))
+	        return TRUE;
 
-		RECT windowRect;
-		if (GetWindowRect(hwnd, &windowRect)) {
-			// convert window rect to desktop coordinates
+	    if (!IsWindowOpaque(hwnd))
+	        return TRUE;
+
+	    if (IsShellOverlay(hwnd))
+	        return TRUE;
+
+	    RECT windowRect;
+	    if (GetWindowRect(hwnd, &windowRect)) {
+	        // convert window rect to desktop coordinates
 			windowRect.left -= g_desktopX;
 			windowRect.right -= g_desktopX;
 			windowRect.top -= g_desktopY;
@@ -370,9 +452,9 @@ namespace lumin
 				// store the occluded area
 				occlusionData->occludedRects.push_back(intersectionRect);
 			}
-		}
+	    }
 
-		return TRUE;
+	    return TRUE;
 	}
 
 	bool IsMonitorOccluded(const MonitorInfo &monitor, double threshold)
@@ -385,29 +467,6 @@ namespace lumin
 		double occlusionFraction = ComputeOcclusionFraction(occlusionData.occludedRects, monitor);
 		return occlusionFraction >= threshold;
 	}
-
-	// Desktop locking detection
-	struct DesktopCloser
-	{
-		void operator()(HDESK h) const noexcept
-		{
-			if (h) {
-				CloseDesktop(h);
-			}
-		}
-	};
-	using unique_desktop = std::unique_ptr<std::remove_pointer_t<HDESK>, DesktopCloser>;
-
-	struct HandleCloser
-	{
-		void operator()(HANDLE h) const noexcept
-		{
-			if (h) {
-				CloseHandle(h);
-			}
-		}
-	};
-	using unique_handle = std::unique_ptr<std::remove_pointer_t<HANDLE>, HandleCloser>;
 
 	static bool IsSecureDesktop()
 	{
